@@ -5,7 +5,7 @@
  * Falls back to browser SpeechRecognition if AssemblyAI fails
  */
 
-const ASSEMBLYAI_WS_BASE = 'wss://streaming.assemblyai.com/v3/ws'
+const ASSEMBLYAI_WS_BASE = 'wss://api.assemblyai.com/v2/realtime/ws'
 
 export class SpeechService {
   constructor() {
@@ -54,8 +54,15 @@ export class SpeechService {
     // 1. Get temporary token via our proxy to avoid CORS
     this.onStatusChange?.('connecting')
     const tokenRes = await fetch(
-      `/api/assembly/v3/token?expires_in_seconds=600`,
-      { headers: { Authorization: apiKey } }
+      `/api/assembly/v2/realtime/token`,
+      { 
+        method: 'POST',
+        headers: { 
+          'Authorization': apiKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ expires_in: 3600 })
+      }
     )
     if (!tokenRes.ok) throw new Error(`Token request failed: ${tokenRes.status}`)
     const { token } = await tokenRes.json()

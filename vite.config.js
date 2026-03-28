@@ -12,7 +12,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api/assembly': {
-        target: 'https://streaming.assemblyai.com',
+        target: 'https://api.assemblyai.com',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/assembly/, ''),
       },

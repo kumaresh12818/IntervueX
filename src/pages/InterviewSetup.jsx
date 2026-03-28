@@ -6,7 +6,7 @@ import {
   Upload, FileText, Briefcase, ChevronRight, AlertCircle,
   CheckCircle2, X, Sparkles, GraduationCap, Loader2
 } from 'lucide-react'
-import { ref, uploadBytes, getDownloadURL } from 'firebase/storage'
+import { getStorage } from 'firebase/storage'   // keep it for other parts though we are removing uploadBytes and getDownloadURL
 import { storage } from '../services/firebase'
 import { useAuth } from '../context/AuthContext'
 import Navbar from '../components/layout/Navbar'
@@ -95,16 +95,28 @@ export default function InterviewSetup() {
     }
   }
 
-  // Upload CV to Firebase Storage
+  // Upload CV to Cloudinary
   const uploadCV = async (file) => {
     setUploading(true)
     setError('')
     try {
-      const storageRef = ref(storage, `cvs/${user.uid}/${Date.now()}_${file.name}`)
-      await uploadBytes(storageRef, file)
-      const url = await getDownloadURL(storageRef)
-      setCvUrl(url)
-      return url
+      const cloudName = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME
+      const uploadPreset = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET
+      
+      const formData = new FormData()
+      formData.append('file', file)
+      formData.append('upload_preset', uploadPreset)
+
+      const response = await fetch(`https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`, {
+        method: 'POST',
+        body: formData,
+      })
+      
+      if (!response.ok) throw new Error('Cloudinary upload failed')
+      
+      const data = await response.json()
+      setCvUrl(data.secure_url)
+      return data.secure_url
     } catch (err) {
       console.error('Upload error:', err)
       setError('Failed to upload CV. Please try again.')
