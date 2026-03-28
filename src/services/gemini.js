@@ -232,7 +232,7 @@ export class GeminiLiveService {
 
 export async function analyzeInterview(apiKey, transcript, role, cvText) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`
-  const prompt = `You are an expert interview coach. Analyze this interview.\n\nTarget Role: ${role || 'General'}\nCV: ${cvText?.substring(0, 2000) || 'None'}\n\nTranscript:\n${transcript}\n\nReturn EXACTLY this JSON structure. Do not include markdown formatting.\n{"overallScore":8.5,"summary":"...","strengths":[{"point":"...","detail":"..."}],"improvements":[{"point":"...","detail":"..."}],"questionAnalysis":[{"question":"...","answerQuality":8.0,"feedback":"..."}],"communicationScore":8.0,"technicalScore":8.0,"confidenceScore":8.0,"tip":"..."}`
+  const prompt = `You are an expert interview coach. Analyze this interview.\n\nTarget Role: ${role || 'General'}\nCV: ${cvText?.substring(0, 2000) || 'None'}\n\nTranscript:\n${transcript}\n\nReturn EXACTLY this JSON structure. \n\nCRITICAL RULE: DO NOT use double quotes (") inside your string values (e.g., in feedback or summaries). If you must quote the candidate, use single quotes ('). Inner double quotes will corrupt the JSON and crash the system.\n\n{"overallScore":8.5,"summary":"...","strengths":[{"point":"...","detail":"..."}],"improvements":[{"point":"...","detail":"..."}],"questionAnalysis":[{"question":"...","answerQuality":8.0,"feedback":"..."}],"communicationScore":8.0,"technicalScore":8.0,"confidenceScore":8.0,"tip":"..."}`
 
   const res = await fetch(url, {
     method: 'POST',
@@ -277,8 +277,14 @@ export async function analyzeInterview(apiKey, transcript, role, cvText) {
   try {
     return JSON.parse(text)
   } catch (err) {
-    const match = text.match(/\{[\s\S]*\}/)
-    if (match) return JSON.parse(match[0])
+    try {
+      // Try to extract JSON if it was accidentally wrapped in text
+      const match = text.match(/\{[\s\S]*\}/)
+      if (match) return JSON.parse(match[0])
+    } catch (innerErr) {
+      // If it still fails, the JSON is irrecoverably corrupted (likely an unescaped quote)
+      throw new Error('Irrecoverable JSON parse error: ' + innerErr.message + '\nRaw Payload: ' + text.substring(0, 100))
+    }
     throw new Error('Failed to parse analysis: ' + text)
   }
 }
