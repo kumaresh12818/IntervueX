@@ -29,7 +29,7 @@ export default function InterviewLive() {
   const [audioLevel, setAudioLevel] = useState(0)
   const [textInput, setTextInput] = useState('')
   const [ending, setEnding] = useState(false)
-  const [speechMode, setSpeechMode] = useState(null) // 'assemblyai' | 'native' | 'text-only'
+  const [speechMode, setSpeechMode] = useState(null) // 'deepgram' | 'native' | 'text-only'
   const [partial, setPartial] = useState('')
 
   const videoRef = useRef(null)
@@ -139,7 +139,7 @@ RULES:
       if (gemini.isConnected) {
         clearInterval(waitForConnection)
 
-        // --- Speech recognition setup (AssemblyAI → native → text-only) ---
+        // --- Speech recognition setup (Deepgram → native → text-only) ---
         const speech = new SpeechService()
         speechRef.current = speech
 
@@ -156,8 +156,8 @@ RULES:
           else if (status === 'text-only') setSpeechMode('text-only')
         }
 
-        const assemblyKey = import.meta.env.VITE_ASSEMBLYAI_API_KEY
-        speech.start(assemblyKey)
+        const dgKey = import.meta.env.VITE_DEEPGRAM_API_KEY
+        speech.start(dgKey)
 
         // Trigger AI greeting
         setTimeout(() => {
@@ -216,7 +216,10 @@ RULES:
 
     let analysis
     try { analysis = await analyzeInterview(apiKey, tText, targetRole, cvText) }
-    catch { analysis = { overallScore: 7, summary: 'Interview completed.', strengths: [], improvements: [], questionAnalysis: [], communicationScore: 7, technicalScore: 7, confidenceScore: 7, tip: 'Keep practicing!' } }
+    catch (err) { 
+        console.error('[Gemini Analysis Error]', err)
+        analysis = { overallScore: 7, summary: 'Interview completed.', strengths: [], improvements: [], questionAnalysis: [], communicationScore: 7, technicalScore: 7, confidenceScore: 7, tip: 'Keep practicing!' } 
+    }
 
     let savedId = null
     try {
@@ -233,7 +236,7 @@ RULES:
   }
 
   const stateLabel = { idle: 'Initializing...', connecting: 'Connecting...', connected: 'Connected', listening: 'Listening', speaking: 'AI Speaking', disconnected: 'Disconnected' }
-  const speechLabel = { assemblyai: '🎤 AssemblyAI', native: '🎤 Chrome Voice', 'text-only': '⌨️ Text Only' }
+  const speechLabel = { deepgram: '🎤 Deepgram', native: '🎤 Chrome Voice', 'text-only': '⌨️ Text Only' }
 
   return (
     <div className="h-screen flex flex-col bg-[#0a0a0a] text-white overflow-hidden">

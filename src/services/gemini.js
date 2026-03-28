@@ -232,16 +232,29 @@ export class GeminiLiveService {
 
 export async function analyzeInterview(apiKey, transcript, role, cvText) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`
-  const prompt = `You are an expert interview coach. Analyze this interview.\n\nTarget Role: ${role}\nCV: ${cvText?.substring(0, 2000) || 'N/A'}\n\nTranscript:\n${transcript}\n\nRespond ONLY with valid JSON:\n{"overallScore":<0-10>,"summary":"<2-3 sentences>","strengths":[{"point":"","detail":""}],"improvements":[{"point":"","detail":""}],"questionAnalysis":[{"question":"","answerQuality":<0-10>,"feedback":""}],"communicationScore":<0-10>,"technicalScore":<0-10>,"confidenceScore":<0-10>,"tip":"<one actionable tip>"}`
+  const prompt = `You are an expert interview coach. Analyze this interview.\n\nTarget Role: ${role || 'General'}\nCV: ${cvText?.substring(0, 2000) || 'None'}\n\nTranscript:\n${transcript}\n\nReturn EXACTLY this JSON structure. Do not include markdown formatting.\n{"overallScore":8.5,"summary":"...","strengths":[{"point":"...","detail":"..."}],"improvements":[{"point":"...","detail":"..."}],"questionAnalysis":[{"question":"...","answerQuality":8.0,"feedback":"..."}],"communicationScore":8.0,"technicalScore":8.0,"confidenceScore":8.0,"tip":"..."}`
 
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { temperature: 0.7, maxOutputTokens: 4096 } })
+    body: JSON.stringify({ 
+      contents: [{ parts: [{ text: prompt }] }], 
+      generationConfig: { 
+        temperature: 0.2, 
+        maxOutputTokens: 4096,
+        responseMimeType: "application/json"
+      } 
+    })
   })
   const data = await res.json()
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
-  const match = text.match(/\{[\s\S]*\}/)
-  if (match) return JSON.parse(match[0])
-  throw new Error('Failed to parse analysis')
+  if (data.error) throw new Error(data.error.message)
+  
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
+  try {
+    return JSON.parse(text)
+  } catch (err) {
+    const match = text.match(/\{[\s\S]*\}/)
+    if (match) return JSON.parse(match[0])
+    throw new Error('Failed to parse analysis: ' + text)
+  }
 }

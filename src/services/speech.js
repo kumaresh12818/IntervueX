@@ -1,11 +1,9 @@
 /**
- * IntervueX — AssemblyAI Real-Time Speech Recognition Service
+ * IntervueX — Deepgram Real-Time Speech Recognition Service
  * Works in ALL browsers (Opera GX, Firefox, Safari, Chrome, Edge)
- * Uses AssemblyAI streaming API via WebSocket with PCM audio from mic
- * Falls back to browser SpeechRecognition if AssemblyAI fails
+ * Uses Deepgram streaming API via WebSocket with PCM audio from mic
+ * Falls back to browser SpeechRecognition if Deepgram fails
  */
-
-const ASSEMBLYAI_WS_BASE = 'wss://streaming.assemblyai.com/v3/ws'
 
 export class SpeechService {
   constructor() {
@@ -19,19 +17,20 @@ export class SpeechService {
     this.onPartialTranscript = null
     this.onError = null
     this.onStatusChange = null
-    this.mode = null // 'assemblyai' | 'native' | 'text-only'
+    this.mode = null // 'deepgram' | 'native' | 'text-only'
+    this._utteranceBuffer = ''
+    this._keepAliveInterval = null
   }
 
-  async start(assemblyAiKey) {
-    // Skip AssemblyAI since free tier API keys reject Real-Time websocket connections (1011/404)
-    // if (assemblyAiKey) {
-    //   try {
-    //     await this._startAssemblyAI(assemblyAiKey)
-    //     return
-    //   } catch (err) {
-    //     console.warn('[Speech] AssemblyAI failed, trying native fallback:', err.message)
-    //   }
-    // }
+  async start(apiKey) {
+    if (apiKey) {
+      try {
+        await this._startDeepgram(apiKey)
+        return
+      } catch (err) {
+        console.warn('[Speech] Deepgram failed, trying native fallback:', err.message)
+      }
+    }
 
     // Fallback: native SpeechRecognition (Chrome/Edge only)
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition
@@ -50,29 +49,21 @@ export class SpeechService {
     console.log('[Speech] No speech recognition available. Text-only mode.')
   }
 
-  async _startAssemblyAI(apiKey) {
-    // 1. Get temporary token via our proxy to avoid CORS
+  async _startDeepgram(apiKey) {
     this.onStatusChange?.('connecting')
-    const tokenRes = await fetch(
-      `/api/assembly/v3/token?expires_in_seconds=600`,
-      { headers: { Authorization: apiKey } }
-    )
-    if (!tokenRes.ok) throw new Error(`Token request failed: ${tokenRes.status}`)
-    const { token } = await tokenRes.json()
 
-    // 2. Get mic access
     this.micStream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     })
 
-    // 3. Set up audio processing at 16kHz
     this.audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 })
     const source = this.audioCtx.createMediaStreamSource(this.micStream)
     const nativeRate = this.audioCtx.sampleRate
 
-    // 4. Connect to AssemblyAI
-    const wsUrl = `${ASSEMBLYAI_WS_BASE}?sample_rate=${nativeRate <= 16000 ? nativeRate : 16000}&token=${token}`
-    this.ws = new WebSocket(wsUrl)
+    const wsUrl = `wss://api.deepgram.com/v1/listen?model=nova-2&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&utterance_end_ms=4000&vad_events=true&smart_format=true&punctuate=true`
+    
+    // Pass the key via WebSockets protocol auth Header
+    this.ws = new WebSocket(wsUrl, ['token', apiKey])
 
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('WebSocket timeout')), 10000)
@@ -83,11 +74,29 @@ export class SpeechService {
     this.ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data)
-        if (data.type === 'Turn') {
-          if (data.end_of_turn && data.transcript?.trim()) {
-            this.onFinalTranscript?.(data.transcript.trim())
-          } else if (data.transcript) {
-            this.onPartialTranscript?.(data.transcript)
+        // 1. Handle complete silence detection (True End of Turn)
+        if (data.type === 'UtteranceEnd') {
+          const finalUtterance = this._utteranceBuffer.trim()
+          if (finalUtterance) {
+            this.onFinalTranscript?.(finalUtterance)
+            this._utteranceBuffer = ''
+          }
+          return
+        }
+
+        // 2. Handle actively streaming words
+        if (data.type === 'Results' && data.channel?.alternatives?.[0]) {
+          const transcript = data.channel.alternatives[0].transcript
+          
+          if (data.is_final) {
+            if (transcript) this._utteranceBuffer += transcript + ' '
+          }
+
+          const currentPartial = (data.is_final ? '' : transcript || '')
+          const currentText = (this._utteranceBuffer + currentPartial).trim()
+          
+          if (currentText) {
+            this.onPartialTranscript?.(currentText)
           }
         }
       } catch {}
@@ -95,14 +104,13 @@ export class SpeechService {
 
     this.ws.onclose = () => {
       if (this.isActive) {
-        console.log('[Speech] AssemblyAI WebSocket closed')
+        console.log('[Speech] Deepgram WebSocket closed')
         this.onStatusChange?.('disconnected')
       }
     }
 
     this.ws.onerror = () => this.onError?.('Speech recognition connection error')
 
-    // 5. Stream audio as PCM int16
     this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1)
     this.processor.onaudioprocess = (e) => {
       if (!this.isActive || this.isMuted) return
@@ -110,7 +118,6 @@ export class SpeechService {
 
       let float32 = e.inputBuffer.getChannelData(0)
 
-      // Downsample if needed (simple linear interpolation)
       if (nativeRate > 16000) {
         const ratio = nativeRate / 16000
         const newLen = Math.floor(float32.length / ratio)
@@ -124,14 +131,12 @@ export class SpeechService {
         float32 = resampled
       }
 
-      // Convert to int16 PCM
       const int16 = new Int16Array(float32.length)
       for (let i = 0; i < float32.length; i++) {
         const s = Math.max(-1, Math.min(1, float32[i]))
         int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
       }
 
-      // Send as binary
       this.ws.send(int16.buffer)
     }
 
@@ -139,9 +144,9 @@ export class SpeechService {
     this.processor.connect(this.audioCtx.destination)
 
     this.isActive = true
-    this.mode = 'assemblyai'
+    this.mode = 'deepgram'
     this.onStatusChange?.('active')
-    console.log(`[Speech] AssemblyAI active (mic: ${nativeRate}Hz)`)
+    console.log(`[Speech] Deepgram active (mic: ${nativeRate}Hz)`)
   }
 
   _startNative(SR) {
@@ -183,6 +188,17 @@ export class SpeechService {
   mute() {
     this.isMuted = true
     if (this._nativeRec) try { this._nativeRec.stop() } catch {}
+
+    // Prevent Deepgram from closing the socket (12s idle timeout) when we stop sending audio
+    if (this.mode === 'deepgram' && this.ws?.readyState === WebSocket.OPEN) {
+      if (!this._keepAliveInterval) {
+        this._keepAliveInterval = setInterval(() => {
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: 'KeepAlive' }))
+          }
+        }, 3000)
+      }
+    }
   }
 
   unmute() {
@@ -190,18 +206,29 @@ export class SpeechService {
     if (this._nativeRec && this.isActive) {
       try { this._nativeRec.start() } catch {}
     }
+    
+    if (this._keepAliveInterval) {
+      clearInterval(this._keepAliveInterval)
+      this._keepAliveInterval = null
+    }
   }
 
   stop() {
     this.isActive = false
     this.isMuted = false
 
+    if (this._keepAliveInterval) {
+      clearInterval(this._keepAliveInterval)
+      this._keepAliveInterval = null
+    }
+
     if (this._nativeRec) { try { this._nativeRec.stop() } catch {}; this._nativeRec = null }
+    this._utteranceBuffer = ''
     if (this.processor) { this.processor.disconnect(); this.processor = null }
     if (this.micStream) { this.micStream.getTracks().forEach(t => t.stop()); this.micStream = null }
     if (this.audioCtx) { this.audioCtx.close().catch(() => {}); this.audioCtx = null }
     if (this.ws) {
-      try { this.ws.send(JSON.stringify({ type: 'Terminate' })) } catch {}
+      try { this.ws.send(JSON.stringify({ type: 'CloseStream' })) } catch {}
       this.ws.close()
       this.ws = null
     }
