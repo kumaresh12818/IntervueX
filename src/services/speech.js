@@ -51,10 +51,10 @@ export class SpeechService {
   }
 
   async _startAssemblyAI(apiKey) {
-    // 1. Get temporary token
+    // 1. Get temporary token via our proxy to avoid CORS
     this.onStatusChange?.('connecting')
     const tokenRes = await fetch(
-      `https://streaming.assemblyai.com/v3/token?expires_in_seconds=600`,
+      `/api/assembly/v3/token?expires_in_seconds=600`,
       { headers: { Authorization: apiKey } }
     )
     if (!tokenRes.ok) throw new Error(`Token request failed: ${tokenRes.status}`)

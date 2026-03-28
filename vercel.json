@@ -1,5 +1,6 @@
 {
   "rewrites": [
+    { "source": "/api/assembly/:path*", "destination": "https://streaming.assemblyai.com/:path*" },
     { "source": "/(.*)", "destination": "/index.html" }
   ]
 }
