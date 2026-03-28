@@ -23,15 +23,15 @@ export class SpeechService {
   }
 
   async start(assemblyAiKey) {
-    // Try AssemblyAI first (works in ALL browsers)
-    if (assemblyAiKey) {
-      try {
-        await this._startAssemblyAI(assemblyAiKey)
-        return
-      } catch (err) {
-        console.warn('[Speech] AssemblyAI failed, trying native fallback:', err.message)
-      }
-    }
+    // Skip AssemblyAI since free tier API keys reject Real-Time websocket connections (1011/404)
+    // if (assemblyAiKey) {
+    //   try {
+    //     await this._startAssemblyAI(assemblyAiKey)
+    //     return
+    //   } catch (err) {
+    //     console.warn('[Speech] AssemblyAI failed, trying native fallback:', err.message)
+    //   }
+    // }
 
     // Fallback: native SpeechRecognition (Chrome/Edge only)
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition
