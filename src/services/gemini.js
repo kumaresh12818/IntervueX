@@ -241,8 +241,32 @@ export async function analyzeInterview(apiKey, transcript, role, cvText) {
       contents: [{ parts: [{ text: prompt }] }], 
       generationConfig: { 
         temperature: 0.2, 
-        maxOutputTokens: 4096,
-        responseMimeType: "application/json"
+        maxOutputTokens: 8192,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: "OBJECT",
+          properties: {
+            overallScore: { type: "NUMBER" },
+            summary: { type: "STRING" },
+            strengths: { 
+              type: "ARRAY", 
+              items: { type: "OBJECT", properties: { point: { type: "STRING" }, detail: { type: "STRING" } } } 
+            },
+            improvements: { 
+              type: "ARRAY", 
+              items: { type: "OBJECT", properties: { point: { type: "STRING" }, detail: { type: "STRING" } } } 
+            },
+            questionAnalysis: { 
+              type: "ARRAY", 
+              items: { type: "OBJECT", properties: { question: { type: "STRING" }, answerQuality: { type: "NUMBER" }, feedback: { type: "STRING" } } } 
+            },
+            communicationScore: { type: "NUMBER" },
+            technicalScore: { type: "NUMBER" },
+            confidenceScore: { type: "NUMBER" },
+            tip: { type: "STRING" }
+          },
+          required: ["overallScore", "summary", "strengths", "improvements", "questionAnalysis", "communicationScore", "technicalScore", "confidenceScore", "tip"]
+        }
       } 
     })
   })
