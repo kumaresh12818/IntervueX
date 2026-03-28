@@ -1,6 +1,6 @@
 /**
  * IntervueX — Gemini Live API Service
- * Uses raw audio streaming (works in ALL browsers) + audio output.
+ * Text input + audio output. No raw audio streaming (unreliable across browsers).
  * Supports model fallback and multi-endpoint retry.
  */
 
@@ -33,16 +33,7 @@ export class GeminiLiveService {
     this.epIdx = 0
     this.setupOk = false
     this.currentModel = ''
-    this.systemInstruction = ''
-    this.voiceName = 'Kore'
 
-    // Mic state
-    this.micStream = null
-    this.micCtx = null
-    this.micProcessor = null
-    this.micActive = false
-
-    // Callbacks
     this.onStateChange = null
     this.onTranscript = null
     this.onError = null
@@ -76,10 +67,9 @@ export class GeminiLiveService {
       setTimeout(() => this._tryModel(), 500)
       return
     }
-    const url = endpoints[this.epIdx]
     this.onStateChange?.('connecting')
 
-    try { this.ws = new WebSocket(url) }
+    try { this.ws = new WebSocket(endpoints[this.epIdx]) }
     catch (e) { this.epIdx++; this._tryEndpoint(); return }
 
     this.ws.onopen = () => {
@@ -94,7 +84,6 @@ export class GeminiLiveService {
           },
           systemInstruction: { parts: [{ text: this.systemInstruction }] },
           realtimeInputConfig: { automaticActivityDetection: { disabled: false } },
-          inputAudioTranscription: {},
           outputAudioTranscription: {},
         }
       }
@@ -104,12 +93,10 @@ export class GeminiLiveService {
     this.ws.onmessage = (event) => {
       const raw = event.data
       if (raw instanceof Blob) {
-        raw.text().then(txt => {
-          try { this._handleMsg(JSON.parse(txt)) } catch (e) {}
-        })
+        raw.text().then(txt => { try { this._handleMsg(JSON.parse(txt)) } catch {} })
         return
       }
-      try { this._handleMsg(JSON.parse(raw)) } catch (e) {}
+      try { this._handleMsg(JSON.parse(raw)) } catch {}
     }
 
     this.ws.onerror = () => {}
@@ -166,9 +153,6 @@ export class GeminiLiveService {
       }
     }
 
-    const it = sc.inputTranscription || sc.input_transcription
-    if (it?.text) this.onTranscript?.('user', it.text)
-
     const ot = sc.outputTranscription || sc.output_transcription
     if (ot?.text) this.pendingText += ot.text
 
@@ -184,7 +168,6 @@ export class GeminiLiveService {
       clearTimeout(this.safetyTimer)
       this.safetyTimer = setTimeout(() => {
         if (this.isPlaying) {
-          console.warn('[Gemini] Safety timeout: forcing listening state')
           this.isPlaying = false
           this.audioQueue = []
           this.onStateChange?.('listening')
@@ -233,96 +216,12 @@ export class GeminiLiveService {
     }
   }
 
-  // ═══ Microphone: raw PCM streaming (works in ALL browsers) ═══
-
-  async startMic() {
-    if (this.micStream) return
-    try {
-      this.micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
-      })
-      this.micCtx = new (window.AudioContext || window.webkitAudioContext)()
-      const source = this.micCtx.createMediaStreamSource(this.micStream)
-      const nativeRate = this.micCtx.sampleRate
-
-      // ScriptProcessorNode: deprecated but works in ALL browsers including Opera GX
-      this.micProcessor = this.micCtx.createScriptProcessor(4096, 1, 1)
-      this.micProcessor.onaudioprocess = (e) => {
-        if (!this.isConnected || !this.micActive) return
-        // Don't send audio while AI is speaking (prevents echo/feedback)
-        if (this.isPlaying) return
-
-        let float32 = e.inputBuffer.getChannelData(0)
-
-        // Downsample to 16kHz if needed
-        if (nativeRate !== 16000) {
-          float32 = this._downsample(float32, nativeRate, 16000)
-        }
-
-        // Convert float32 to int16 PCM
-        const int16 = new Int16Array(float32.length)
-        for (let i = 0; i < float32.length; i++) {
-          const s = Math.max(-1, Math.min(1, float32[i]))
-          int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
-        }
-
-        // Base64 encode
-        const uint8 = new Uint8Array(int16.buffer)
-        let binary = ''
-        const chunk = 8192
-        for (let i = 0; i < uint8.length; i += chunk) {
-          binary += String.fromCharCode.apply(null, uint8.subarray(i, Math.min(i + chunk, uint8.length)))
-        }
-
-        this._sendAudioChunk(btoa(binary))
-      }
-
-      source.connect(this.micProcessor)
-      this.micProcessor.connect(this.micCtx.destination)
-      this.micActive = true
-      console.log(`[Gemini] Mic started (native: ${nativeRate}Hz → sending 16kHz PCM)`)
-    } catch (err) {
-      console.error('[Gemini] Mic error:', err)
-      this.onError?.('Microphone access denied. Please allow mic access and try again.')
-    }
-  }
-
-  muteMic() { this.micActive = false }
-  unmuteMic() { this.micActive = true }
-
-  destroyMic() {
-    this.micActive = false
-    if (this.micProcessor) { this.micProcessor.disconnect(); this.micProcessor = null }
-    if (this.micStream) { this.micStream.getTracks().forEach(t => t.stop()); this.micStream = null }
-    if (this.micCtx) { this.micCtx.close().catch(() => {}); this.micCtx = null }
-  }
-
-  _sendAudioChunk(base64) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
-    this.ws.send(JSON.stringify({
-      realtimeInput: {
-        mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: base64 }]
-      }
-    }))
-  }
-
-  _downsample(buffer, fromRate, toRate) {
-    const ratio = fromRate / toRate
-    const newLen = Math.floor(buffer.length / ratio)
-    const result = new Float32Array(newLen)
-    for (let i = 0; i < newLen; i++) {
-      result[i] = buffer[Math.floor(i * ratio)]
-    }
-    return result
-  }
-
   sendText(text) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
     this.ws.send(JSON.stringify({ realtimeInput: { text } }))
   }
 
   disconnect() {
-    this.destroyMic()
     if (this.ws) { this.ws.onclose = null; this.ws.close(); this.ws = null }
     if (this.playCtx) { this.playCtx.close().catch(() => {}); this.playCtx = null }
     this.audioQueue = []; this.isPlaying = false; this.isConnected = false

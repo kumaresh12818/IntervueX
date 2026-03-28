@@ -3,13 +3,15 @@ import { useLocation, useNavigate } from 'react-router-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   Mic, MicOff, Video, VideoOff, PhoneOff, Clock,
-  MessageSquare, AlertCircle, Send, Radio, X
+  MessageSquare, AlertCircle, Send, Radio, X, Keyboard
 } from 'lucide-react'
 import { addDoc, collection, serverTimestamp } from 'firebase/firestore'
 import { db } from '../services/firebase'
 import { useAuth } from '../context/AuthContext'
 import { GeminiLiveService, analyzeInterview } from '../services/gemini'
 import AnimatedOrb from '../components/ui/AnimatedOrb'
+
+const hasSpeechRecognition = !!(window.SpeechRecognition || window.webkitSpeechRecognition)
 
 export default function InterviewLive() {
   const location = useLocation()
@@ -19,7 +21,7 @@ export default function InterviewLive() {
   const userName = user?.displayName || user?.email?.split('@')[0] || 'Candidate'
 
   const [connState, setConnState] = useState('idle')
-  const [isMicOn, setIsMicOn] = useState(true)
+  const [isMicOn, setIsMicOn] = useState(hasSpeechRecognition)
   const [isCameraOn, setIsCameraOn] = useState(true)
   const [showChat, setShowChat] = useState(true)
   const [transcript, setTranscript] = useState([])
@@ -28,6 +30,7 @@ export default function InterviewLive() {
   const [audioLevel, setAudioLevel] = useState(0)
   const [textInput, setTextInput] = useState('')
   const [ending, setEnding] = useState(false)
+  const [voiceSupported] = useState(hasSpeechRecognition)
 
   const videoRef = useRef(null)
   const geminiRef = useRef(null)
@@ -37,16 +40,23 @@ export default function InterviewLive() {
   const recognitionRef = useRef(null)
   const chatEndRef = useRef(null)
   const transcriptRef = useRef([])
+  const isMicRef = useRef(hasSpeechRecognition)
+  const isPlayingRef = useRef(false)
 
   const formatTime = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
 
-  // Keep refs in sync
+  useEffect(() => { isMicRef.current = isMicOn }, [isMicOn])
   useEffect(() => { transcriptRef.current = transcript }, [transcript])
   useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [transcript])
 
+  // Track isPlaying via ref so speech recognition callback can access it
+  useEffect(() => {
+    isPlayingRef.current = connState === 'speaking'
+  }, [connState])
+
   // Timer
   useEffect(() => {
-    if (connState === 'connected' || connState === 'speaking' || connState === 'listening') {
+    if (['connected', 'speaking', 'listening'].includes(connState)) {
       if (!startTimeRef.current) startTimeRef.current = Date.now()
       timerRef.current = setInterval(() => {
         setElapsed(Math.floor((Date.now() - startTimeRef.current) / 1000))
@@ -55,7 +65,7 @@ export default function InterviewLive() {
     return () => clearInterval(timerRef.current)
   }, [connState])
 
-  // Fade audio level when not speaking
+  // Fade audio level
   useEffect(() => {
     if (connState !== 'speaking') {
       const fade = setInterval(() => setAudioLevel(prev => Math.max(0, prev - 0.05)), 50)
@@ -63,7 +73,7 @@ export default function InterviewLive() {
     }
   }, [connState])
 
-  // Setup camera
+  // Setup camera (video only, no audio)
   const setupCamera = useCallback(async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -78,12 +88,60 @@ export default function InterviewLive() {
     }
   }, [])
 
-  // Connect to Gemini and start everything
+  // Setup Speech Recognition (Chrome/Edge only)
+  const setupSpeechRecognition = useCallback(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SR) return
+
+    const rec = new SR()
+    rec.continuous = true
+    rec.interimResults = false  // Only final results to avoid noise
+    rec.lang = 'en-US'
+    rec.maxAlternatives = 1
+
+    rec.onresult = (event) => {
+      if (!isMicRef.current || !geminiRef.current?.isConnected) return
+      // Skip input while AI is speaking to prevent echo feedback
+      if (isPlayingRef.current) return
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        if (event.results[i].isFinal) {
+          const text = event.results[i][0].transcript.trim()
+          if (text && text.length > 1) {
+            geminiRef.current.sendText(text)
+            setTranscript(prev => [...prev, { role: 'user', text, time: Date.now() }])
+          }
+        }
+      }
+    }
+
+    rec.onerror = (e) => {
+      console.warn('[SpeechRecognition] Error:', e.error)
+      if (e.error === 'not-allowed') {
+        setError('Microphone blocked. Please allow mic access in browser settings.')
+      }
+      // Don't restart on these fatal errors
+      if (['not-allowed', 'service-not-allowed'].includes(e.error)) return
+    }
+
+    rec.onend = () => {
+      // Auto-restart if mic is still on and connected
+      if (isMicRef.current && geminiRef.current?.isConnected) {
+        setTimeout(() => {
+          try { rec.start() } catch {}
+        }, 100)
+      }
+    }
+
+    recognitionRef.current = rec
+  }, [])
+
+  // Connect to Gemini
   const startInterview = useCallback(async () => {
     setError('')
     const apiKey = import.meta.env.VITE_GEMINI_API_KEY
     if (!apiKey) {
-      setError('Gemini API key not configured. Add VITE_GEMINI_API_KEY to .env')
+      setError('Gemini API key not configured.')
       return
     }
 
@@ -94,9 +152,10 @@ export default function InterviewLive() {
     gemini.onAudioLevel = (level) => setAudioLevel(level)
     gemini.onError = (msg) => setError(msg)
 
-    // Handle transcripts from both user (inputTranscription) and AI (outputTranscription)
     gemini.onTranscript = (role, text) => {
-      setTranscript(prev => [...prev, { role, text, time: Date.now() }])
+      if (role === 'ai') {
+        setTranscript(prev => [...prev, { role: 'ai', text, time: Date.now() }])
+      }
     }
 
     const sysInstruction = `You are a professional, calm, and friendly AI interviewer conducting a realistic job interview.
@@ -127,21 +186,26 @@ RULES:
 
     gemini.connect(sysInstruction, 'Kore')
 
-    // Wait for connection, then start mic and trigger AI greeting
+    // Wait for connection, then start
     const waitForConnection = setInterval(() => {
       if (gemini.isConnected) {
         clearInterval(waitForConnection)
-        // Start streaming mic audio to Gemini (works in ALL browsers)
-        gemini.startMic()
-        // Trigger the AI to greet first
+        // Start speech recognition if supported
+        if (hasSpeechRecognition) {
+          setupSpeechRecognition()
+          setTimeout(() => {
+            try { recognitionRef.current?.start() } catch {}
+          }, 200)
+        }
+        // Trigger AI greeting
         setTimeout(() => {
-          gemini.sendText(`[The candidate ${userName} has joined the interview room. Please greet them and begin the interview.]`)
+          gemini.sendText(`[The candidate ${userName} has joined. Please greet them and begin the interview.]`)
         }, 1000)
       }
     }, 200)
 
     setTimeout(() => clearInterval(waitForConnection), 30000)
-  }, [userName, targetRole, experienceLevel, cvText])
+  }, [userName, targetRole, experienceLevel, cvText, setupSpeechRecognition])
 
   // Auto-start on mount
   useEffect(() => {
@@ -152,16 +216,20 @@ RULES:
     return () => {
       geminiRef.current?.disconnect()
       cameraStreamRef.current?.getTracks().forEach(t => t.stop())
+      try { recognitionRef.current?.stop() } catch {}
       clearInterval(timerRef.current)
     }
   }, [])
 
-  // Toggle mic — uses Gemini's mute/unmute (no SpeechRecognition needed)
+  // Toggle mic (speech recognition)
   const toggleMic = () => {
+    if (!voiceSupported) return
     const newState = !isMicOn
     setIsMicOn(newState)
-    if (geminiRef.current) {
-      newState ? geminiRef.current.unmuteMic() : geminiRef.current.muteMic()
+    if (newState) {
+      try { recognitionRef.current?.start() } catch {}
+    } else {
+      try { recognitionRef.current?.stop() } catch {}
     }
   }
 
@@ -185,7 +253,7 @@ RULES:
   // End interview
   const endInterview = async () => {
     setEnding(true)
-    recognitionRef.current?.stop()
+    try { recognitionRef.current?.stop() } catch {}
     geminiRef.current?.disconnect()
     cameraStreamRef.current?.getTracks().forEach(t => t.stop())
     clearInterval(timerRef.current)
@@ -195,7 +263,6 @@ RULES:
       ? transcriptRef.current.map(t => `${t.role === 'ai' ? 'Interviewer' : 'Candidate'}: ${t.text}`).join('\n')
       : `Interview lasted ${formatTime(elapsed)}. Voice-only session.`
 
-    // 1. Analyze transcript
     let analysis
     try { analysis = await analyzeInterview(apiKey, tText, targetRole, cvText) }
     catch (err) {
@@ -207,29 +274,19 @@ RULES:
       }
     }
 
-    // 2. Save to Firestore
     let savedId = null
     try {
       if (db && user?.uid) {
         const docRef = await addDoc(collection(db, 'interviews'), {
-          userId: user.uid,
-          targetRole: targetRole || 'General',
-          experienceLevel: experienceLevel || 'not_specified',
-          cvUrl: cvUrl || '',
-          transcript: transcriptRef.current,
-          duration: elapsed,
-          overallScore: analysis.overallScore || 0,
-          analysis,
-          createdAt: serverTimestamp(),
+          userId: user.uid, targetRole: targetRole || 'General',
+          experienceLevel: experienceLevel || 'not_specified', cvUrl: cvUrl || '',
+          transcript: transcriptRef.current, duration: elapsed,
+          overallScore: analysis.overallScore || 0, analysis, createdAt: serverTimestamp(),
         })
         savedId = docRef.id
-        console.log('[Firestore] Interview saved:', savedId)
       }
-    } catch (err) {
-      console.error('[Firestore] Save failed:', err)
-    }
+    } catch (err) { console.error('[Firestore] Save failed:', err) }
 
-    // 3. Navigate to results (works even if Firestore save failed)
     navigate(savedId ? `/interview/result/${savedId}` : '/interview/result/local', {
       state: { analysis, targetRole, elapsed },
     })
@@ -253,7 +310,7 @@ RULES:
         </div>
         <div className="flex items-center gap-3">
           <div className={`flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-mono tracking-wider ${
-            connState === 'connected' || connState === 'listening' || connState === 'speaking'
+            ['connected', 'listening', 'speaking'].includes(connState)
               ? 'bg-green-500/10 text-green-400 border border-green-500/20'
               : connState === 'connecting'
               ? 'bg-blue-500/10 text-blue-400 border border-blue-500/20 animate-pulse'
@@ -284,14 +341,9 @@ RULES:
                 </div>
               </div>
             )}
-            {/* Name label */}
             <div className="absolute bottom-3 left-3 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-black/60 backdrop-blur-sm">
               <span className="text-xs font-medium">{userName}</span>
-              {isMicOn ? (
-                <Mic className="w-3 h-3 text-white/60" />
-              ) : (
-                <MicOff className="w-3 h-3 text-red-400" />
-              )}
+              {isMicOn ? <Mic className="w-3 h-3 text-white/60" /> : <MicOff className="w-3 h-3 text-red-400" />}
             </div>
             <div className="absolute top-3 left-3 px-2 py-0.5 rounded text-[9px] font-mono text-gray-500 bg-black/40">YOU</div>
           </div>
@@ -300,9 +352,7 @@ RULES:
           <div className="flex-1 relative rounded-xl overflow-hidden bg-[#0d0d1a] border border-white/5">
             <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(59,130,246,0.04)_0%,transparent_70%)]" />
             <div className={`absolute inset-0 transition-all duration-1000 ${
-              connState === 'speaking'
-                ? 'bg-[radial-gradient(ellipse_at_center,rgba(139,92,246,0.08)_0%,transparent_60%)]'
-                : ''
+              connState === 'speaking' ? 'bg-[radial-gradient(ellipse_at_center,rgba(139,92,246,0.08)_0%,transparent_60%)]' : ''
             }`} />
             <div className="w-full h-full flex items-center justify-center relative">
               <AnimatedOrb state={connState} audioLevel={audioLevel} />
@@ -327,10 +377,8 @@ RULES:
         <AnimatePresence>
           {showChat && (
             <motion.div
-              initial={{ width: 0, opacity: 0 }}
-              animate={{ width: 320, opacity: 1 }}
-              exit={{ width: 0, opacity: 0 }}
-              transition={{ duration: 0.3 }}
+              initial={{ width: 0, opacity: 0 }} animate={{ width: 320, opacity: 1 }}
+              exit={{ width: 0, opacity: 0 }} transition={{ duration: 0.3 }}
               className="h-full border-l border-white/5 bg-[#111] flex flex-col overflow-hidden"
             >
               <div className="flex items-center justify-between px-4 py-3 border-b border-white/5">
@@ -366,17 +414,14 @@ RULES:
                 <div ref={chatEndRef} />
               </div>
 
-              {/* Text input */}
+              {/* Text input in sidebar */}
               <div className="p-3 border-t border-white/5">
                 <div className="flex gap-2">
-                  <input
-                    value={textInput}
-                    onChange={(e) => setTextInput(e.target.value)}
+                  <input value={textInput} onChange={(e) => setTextInput(e.target.value)}
                     onKeyDown={(e) => e.key === 'Enter' && handleSendText()}
-                    placeholder="Type a message..."
+                    placeholder="Type your answer..."
                     className="flex-1 px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-sm outline-none focus:border-primary/40 text-white placeholder:text-gray-600"
-                    disabled={!geminiRef.current?.isConnected}
-                  />
+                    disabled={!geminiRef.current?.isConnected} />
                   <button onClick={handleSendText} disabled={!textInput.trim()}
                     className="p-2 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 disabled:opacity-30 transition-colors">
                     <Send className="w-4 h-4" />
@@ -388,6 +433,31 @@ RULES:
         </AnimatePresence>
       </div>
 
+      {/* ═══ Voice not supported banner ═══ */}
+      {!voiceSupported && (
+        <div className="flex items-center justify-center gap-2 px-4 py-2 bg-amber-500/10 border-t border-amber-500/20 text-amber-400 text-xs">
+          <Keyboard className="w-3.5 h-3.5" />
+          <span>Voice input not supported in this browser. Use the text input to respond, or switch to <strong>Chrome</strong> for voice.</span>
+        </div>
+      )}
+
+      {/* ═══ Bottom text input for non-voice browsers ═══ */}
+      {!voiceSupported && (
+        <div className="px-4 py-3 bg-[#141414] border-t border-white/5">
+          <div className="max-w-2xl mx-auto flex gap-2">
+            <input value={textInput} onChange={(e) => setTextInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleSendText()}
+              placeholder="Type your response and press Enter..."
+              className="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/10 text-sm outline-none focus:border-primary/40 text-white placeholder:text-gray-500"
+              disabled={!geminiRef.current?.isConnected} autoFocus />
+            <button onClick={handleSendText} disabled={!textInput.trim()}
+              className="px-5 py-3 rounded-xl bg-primary/20 text-primary hover:bg-primary/30 disabled:opacity-30 transition-colors font-medium text-sm flex items-center gap-2">
+              <Send className="w-4 h-4" /> Send
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* ═══ Error Banner ═══ */}
       <AnimatePresence>
         {error && (
@@ -395,20 +465,22 @@ RULES:
             className="absolute bottom-24 left-1/2 -translate-x-1/2 z-30 flex items-center gap-2 px-4 py-2 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm max-w-md">
             <AlertCircle className="w-4 h-4 flex-shrink-0" />
             <span className="flex-1">{error}</span>
-            <button onClick={() => { setError(''); startInterview() }} className="text-xs underline whitespace-nowrap">Retry</button>
+            <button onClick={() => setError('')} className="text-xs underline whitespace-nowrap">Dismiss</button>
           </motion.div>
         )}
       </AnimatePresence>
 
       {/* ═══ Controls Bar ═══ */}
       <div className="flex items-center justify-center gap-3 py-4 px-4 bg-[#1a1a1a]/80 backdrop-blur-md border-t border-white/5 z-20">
-        {/* Mic */}
-        <motion.button whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.92 }} onClick={toggleMic}
-          className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${
-            isMicOn ? 'bg-white/10 hover:bg-white/15 text-white' : 'bg-red-500 hover:bg-red-600 text-white'
-          }`}>
-          {isMicOn ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
-        </motion.button>
+        {/* Mic (only if voice supported) */}
+        {voiceSupported && (
+          <motion.button whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.92 }} onClick={toggleMic}
+            className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${
+              isMicOn ? 'bg-white/10 hover:bg-white/15 text-white' : 'bg-red-500 hover:bg-red-600 text-white'
+            }`}>
+            {isMicOn ? <Mic className="w-5 h-5" /> : <MicOff className="w-5 h-5" />}
+          </motion.button>
+        )}
 
         {/* Camera */}
         <motion.button whileHover={{ scale: 1.08 }} whileTap={{ scale: 0.92 }} onClick={toggleCamera}
