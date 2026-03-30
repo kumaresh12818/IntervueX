@@ -56,13 +56,14 @@ export class SpeechService {
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
     })
 
+    // Request 16 kHz directly; browser may override — we handle both cases in the worklet
     this.audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 })
     const source = this.audioCtx.createMediaStreamSource(this.micStream)
     const nativeRate = this.audioCtx.sampleRate
 
     const wsUrl = `wss://api.deepgram.com/v1/listen?model=nova-2&encoding=linear16&sample_rate=16000&channels=1&interim_results=true&utterance_end_ms=4000&vad_events=true&smart_format=true&punctuate=true`
-    
-    // Pass the key via WebSockets protocol auth Header
+
+    // Pass the key via WebSockets protocol auth header
     this.ws = new WebSocket(wsUrl, ['token', apiKey])
 
     await new Promise((resolve, reject) => {
@@ -87,17 +88,12 @@ export class SpeechService {
         // 2. Handle actively streaming words
         if (data.type === 'Results' && data.channel?.alternatives?.[0]) {
           const transcript = data.channel.alternatives[0].transcript
-          
           if (data.is_final) {
             if (transcript) this._utteranceBuffer += transcript + ' '
           }
-
-          const currentPartial = (data.is_final ? '' : transcript || '')
+          const currentPartial = data.is_final ? '' : (transcript || '')
           const currentText = (this._utteranceBuffer + currentPartial).trim()
-          
-          if (currentText) {
-            this.onPartialTranscript?.(currentText)
-          }
+          if (currentText) this.onPartialTranscript?.(currentText)
         }
       } catch {}
     }
@@ -111,42 +107,67 @@ export class SpeechService {
 
     this.ws.onerror = () => this.onError?.('Speech recognition connection error')
 
-    this.processor = this.audioCtx.createScriptProcessor(4096, 1, 1)
-    this.processor.onaudioprocess = (e) => {
+    // ── AudioWorkletNode (replaces deprecated ScriptProcessorNode) ──────────
+    const workletCode = `
+      class PcmSenderProcessor extends AudioWorkletProcessor {
+        constructor(options) {
+          super()
+          this._ratio = options.processorOptions.ratio
+          this._buf = []
+        }
+        process(inputs) {
+          const ch = inputs[0]?.[0]
+          if (!ch) return true
+          // Linear interpolation down-sample when ratio > 1
+          if (this._ratio > 1.001) {
+            const newLen = Math.floor(ch.length / this._ratio)
+            const out = new Float32Array(newLen)
+            for (let i = 0; i < newLen; i++) {
+              const pos = i * this._ratio
+              const idx = Math.floor(pos)
+              const frac = pos - idx
+              out[i] = ch[idx] * (1 - frac) + (ch[Math.min(idx + 1, ch.length - 1)]) * frac
+            }
+            this.port.postMessage(out)
+          } else {
+            this.port.postMessage(ch.slice())
+          }
+          return true
+        }
+      }
+      registerProcessor('pcm-sender', PcmSenderProcessor)
+    `
+    const blob = new Blob([workletCode], { type: 'application/javascript' })
+    const blobUrl = URL.createObjectURL(blob)
+    await this.audioCtx.audioWorklet.addModule(blobUrl)
+    URL.revokeObjectURL(blobUrl)
+
+    this.processor = new AudioWorkletNode(this.audioCtx, 'pcm-sender', {
+      processorOptions: { ratio: nativeRate / 16000 },
+      channelCount: 1,
+      numberOfInputs: 1,
+      numberOfOutputs: 0,   // no audio output needed
+    })
+
+    this.processor.port.onmessage = (e) => {
       if (!this.isActive || this.isMuted) return
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
-
-      let float32 = e.inputBuffer.getChannelData(0)
-
-      if (nativeRate > 16000) {
-        const ratio = nativeRate / 16000
-        const newLen = Math.floor(float32.length / ratio)
-        const resampled = new Float32Array(newLen)
-        for (let i = 0; i < newLen; i++) {
-          const pos = i * ratio
-          const idx = Math.floor(pos)
-          const frac = pos - idx
-          resampled[i] = float32[idx] * (1 - frac) + (float32[idx + 1] || 0) * frac
-        }
-        float32 = resampled
-      }
-
+      const float32 = e.data
       const int16 = new Int16Array(float32.length)
       for (let i = 0; i < float32.length; i++) {
         const s = Math.max(-1, Math.min(1, float32[i]))
         int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF
       }
-
       this.ws.send(int16.buffer)
     }
 
     source.connect(this.processor)
-    this.processor.connect(this.audioCtx.destination)
+    // WorkletNode with 0 outputs does not need connecting to destination
 
     this.isActive = true
     this.mode = 'deepgram'
     this.onStatusChange?.('active')
-    console.log(`[Speech] Deepgram active (mic: ${nativeRate}Hz)`)
+    console.log(`[Speech] Deepgram active via AudioWorkletNode (mic: ${nativeRate}Hz)`)
   }
 
   _startNative(SR) {
@@ -224,7 +245,11 @@ export class SpeechService {
 
     if (this._nativeRec) { try { this._nativeRec.stop() } catch {}; this._nativeRec = null }
     this._utteranceBuffer = ''
-    if (this.processor) { this.processor.disconnect(); this.processor = null }
+    if (this.processor) {
+      try { this.processor.port.close() } catch {}
+      this.processor.disconnect()
+      this.processor = null
+    }
     if (this.micStream) { this.micStream.getTracks().forEach(t => t.stop()); this.micStream = null }
     if (this.audioCtx) { this.audioCtx.close().catch(() => {}); this.audioCtx = null }
     if (this.ws) {

@@ -232,7 +232,7 @@ export class GeminiLiveService {
 
 export async function analyzeInterview(apiKey, transcript, role, cvText) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`
-  const prompt = `You are an expert interview coach. Analyze this interview.\n\nTarget Role: ${role || 'General'}\nCV: ${cvText?.substring(0, 2000) || 'None'}\n\nTranscript:\n${transcript}\n\nReturn EXACTLY this JSON structure. \n\nCRITICAL RULE: DO NOT use double quotes (") inside your string values (e.g., in feedback or summaries). If you must quote the candidate, use single quotes ('). Inner double quotes will corrupt the JSON and crash the system.\n\n{"overallScore":8.5,"summary":"...","strengths":[{"point":"...","detail":"..."}],"improvements":[{"point":"...","detail":"..."}],"questionAnalysis":[{"question":"...","answerQuality":8.0,"feedback":"..."}],"communicationScore":8.0,"technicalScore":8.0,"confidenceScore":8.0,"tip":"..."}`
+  const prompt = `You are an expert interview coach. Analyze this interview.\n\nTarget Role: ${role || 'General'}\nCV: ${cvText?.substring(0, 2000) || 'None'}\n\nTranscript:\n${transcript}\n\nReturn EXACTLY this JSON structure with NO markdown fences.\n\nCRITICAL RULES:\n1. DO NOT use double quotes (") inside string values. Use single quotes (') if you must quote something.\n2. Keep 'strengths' to AT MOST 5 items. Keep 'improvements' to AT MOST 5 items. Keep 'questionAnalysis' to AT MOST 10 items.\n3. Each 'point' field must be a UNIQUE, concise sentence. Do NOT repeat the same point.\n\n{"overallScore":8.5,"summary":"...","strengths":[{"point":"...","detail":"..."}],"improvements":[{"point":"...","detail":"..."}],"questionAnalysis":[{"question":"...","answerQuality":8.0,"feedback":"..."}],"communicationScore":8.0,"technicalScore":8.0,"confidenceScore":8.0,"tip":"..."}`
 
   const res = await fetch(url, {
     method: 'POST',
@@ -247,23 +247,45 @@ export async function analyzeInterview(apiKey, transcript, role, cvText) {
           type: "OBJECT",
           properties: {
             overallScore: { type: "NUMBER" },
-            summary: { type: "STRING" },
+            summary: { type: "STRING", maxLength: 800 },
             strengths: { 
-              type: "ARRAY", 
-              items: { type: "OBJECT", properties: { point: { type: "STRING" }, detail: { type: "STRING" } } } 
+              type: "ARRAY",
+              maxItems: 5,
+              items: {
+                type: "OBJECT",
+                properties: {
+                  point: { type: "STRING", maxLength: 200 },
+                  detail: { type: "STRING", maxLength: 500 }
+                }
+              }
             },
             improvements: { 
-              type: "ARRAY", 
-              items: { type: "OBJECT", properties: { point: { type: "STRING" }, detail: { type: "STRING" } } } 
+              type: "ARRAY",
+              maxItems: 5,
+              items: {
+                type: "OBJECT",
+                properties: {
+                  point: { type: "STRING", maxLength: 200 },
+                  detail: { type: "STRING", maxLength: 500 }
+                }
+              }
             },
             questionAnalysis: { 
-              type: "ARRAY", 
-              items: { type: "OBJECT", properties: { question: { type: "STRING" }, answerQuality: { type: "NUMBER" }, feedback: { type: "STRING" } } } 
+              type: "ARRAY",
+              maxItems: 10,
+              items: {
+                type: "OBJECT",
+                properties: {
+                  question: { type: "STRING", maxLength: 300 },
+                  answerQuality: { type: "NUMBER" },
+                  feedback: { type: "STRING", maxLength: 600 }
+                }
+              }
             },
             communicationScore: { type: "NUMBER" },
             technicalScore: { type: "NUMBER" },
             confidenceScore: { type: "NUMBER" },
-            tip: { type: "STRING" }
+            tip: { type: "STRING", maxLength: 400 }
           },
           required: ["overallScore", "summary", "strengths", "improvements", "questionAnalysis", "communicationScore", "technicalScore", "confidenceScore", "tip"]
         }
