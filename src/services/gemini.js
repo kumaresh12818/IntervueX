@@ -454,7 +454,7 @@ INSTRUCTIONS — READ CAREFULLY:
 - All scores are numbers from 0 to 10.
 - DO NOT repeat yourself. DO NOT be verbose. DO NOT pad responses.`
 
-  const MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash']
+  const MODELS = ['gemini-2.5-flash', 'gemini-3.1-flash-lite-preview', 'gemini-3-flash-preview']
   const MAX_RETRIES = 3
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
