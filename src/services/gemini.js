@@ -230,83 +230,272 @@ export class GeminiLiveService {
   }
 }
 
-export async function analyzeInterview(apiKey, transcript, role, cvText) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`
-  const prompt = `You are an expert interview coach. Analyze this interview.\n\nTarget Role: ${role || 'General'}\nCV: ${cvText?.substring(0, 2000) || 'None'}\n\nTranscript:\n${transcript}\n\nReturn EXACTLY this JSON structure with NO markdown fences.\n\nCRITICAL RULES:\n1. DO NOT use double quotes (") inside string values. Use single quotes (') if you must quote something.\n2. Keep 'strengths' to AT MOST 5 items. Keep 'improvements' to AT MOST 5 items. Keep 'questionAnalysis' to AT MOST 10 items.\n3. Each 'point' field must be a UNIQUE, concise sentence. Do NOT repeat the same point.\n\n{"overallScore":8.5,"summary":"...","strengths":[{"point":"...","detail":"..."}],"improvements":[{"point":"...","detail":"..."}],"questionAnalysis":[{"question":"...","answerQuality":8.0,"feedback":"..."}],"communicationScore":8.0,"technicalScore":8.0,"confidenceScore":8.0,"tip":"..."}`
+/**
+ * Safely truncate a string to maxLen characters.
+ */
+function truncStr(s, maxLen) {
+  if (typeof s !== 'string') return ''
+  return s.length > maxLen ? s.substring(0, maxLen) + '...' : s
+}
 
+/**
+ * Validate and sanitize the analysis object to ensure all fields are
+ * present and within reasonable bounds. This prevents absurdly long
+ * Gemini responses from breaking the UI.
+ */
+function sanitizeAnalysis(obj) {
+  const defaults = {
+    overallScore: 5,
+    summary: 'Interview analysis completed.',
+    strengths: [],
+    improvements: [],
+    questionAnalysis: [],
+    communicationScore: 5,
+    technicalScore: 5,
+    confidenceScore: 5,
+    tip: 'Keep practicing to improve your interview skills!'
+  }
+  const result = { ...defaults }
+
+  // Scores
+  if (typeof obj.overallScore === 'number') result.overallScore = Math.min(10, Math.max(0, obj.overallScore))
+  if (typeof obj.communicationScore === 'number') result.communicationScore = Math.min(10, Math.max(0, obj.communicationScore))
+  if (typeof obj.technicalScore === 'number') result.technicalScore = Math.min(10, Math.max(0, obj.technicalScore))
+  if (typeof obj.confidenceScore === 'number') result.confidenceScore = Math.min(10, Math.max(0, obj.confidenceScore))
+
+  // Strings
+  if (typeof obj.summary === 'string' && obj.summary.length > 0) result.summary = truncStr(obj.summary, 1000)
+  if (typeof obj.tip === 'string' && obj.tip.length > 0) result.tip = truncStr(obj.tip, 500)
+
+  // Arrays — cap at 5/10 items and truncate each field
+  if (Array.isArray(obj.strengths)) {
+    result.strengths = obj.strengths.slice(0, 5).map(s => ({
+      point: truncStr(s?.point || '', 300),
+      detail: truncStr(s?.detail || '', 600)
+    })).filter(s => s.point.length > 0)
+  }
+  if (Array.isArray(obj.improvements)) {
+    result.improvements = obj.improvements.slice(0, 5).map(s => ({
+      point: truncStr(s?.point || '', 300),
+      detail: truncStr(s?.detail || '', 600)
+    })).filter(s => s.point.length > 0)
+  }
+  if (Array.isArray(obj.questionAnalysis)) {
+    result.questionAnalysis = obj.questionAnalysis.slice(0, 10).map(q => ({
+      question: truncStr(q?.question || '', 400),
+      answerQuality: typeof q?.answerQuality === 'number' ? Math.min(10, Math.max(0, q.answerQuality)) : 5,
+      feedback: truncStr(q?.feedback || '', 800)
+    })).filter(q => q.question.length > 0)
+  }
+
+  return result
+}
+
+/**
+ * Attempt to repair truncated JSON by closing open brackets/braces.
+ */
+function repairTruncatedJson(text) {
+  // Remove trailing incomplete strings (e.g. text cut mid-value)
+  let cleaned = text.replace(/,\s*$/, '') // remove trailing comma
+  
+  // Count open/close brackets
+  let braces = 0, brackets = 0, inString = false, escaped = false
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i]
+    if (escaped) { escaped = false; continue }
+    if (ch === '\\') { escaped = true; continue }
+    if (ch === '"') { inString = !inString; continue }
+    if (inString) continue
+    if (ch === '{') braces++
+    else if (ch === '}') braces--
+    else if (ch === '[') brackets++
+    else if (ch === ']') brackets--
+  }
+
+  // If we're inside a string, try to close it
+  if (inString) cleaned += '"'
+
+  // Close any unclosed arrays and objects
+  while (brackets > 0) { cleaned += ']'; brackets-- }
+  while (braces > 0) { cleaned += '}'; braces-- }
+
+  return cleaned
+}
+
+/**
+ * Make a single analysis API call with the given model.
+ */
+async function callGeminiAnalysis(apiKey, prompt, model) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+  
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ 
-      contents: [{ parts: [{ text: prompt }] }], 
-      generationConfig: { 
-        temperature: 0.2, 
+    body: JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.1,
         maxOutputTokens: 8192,
-        responseMimeType: "application/json",
+        responseMimeType: 'application/json',
         responseSchema: {
-          type: "OBJECT",
+          type: 'OBJECT',
           properties: {
-            overallScore: { type: "NUMBER" },
-            summary: { type: "STRING", maxLength: 800 },
-            strengths: { 
-              type: "ARRAY",
-              maxItems: 5,
+            overallScore: { type: 'NUMBER' },
+            summary: { type: 'STRING' },
+            strengths: {
+              type: 'ARRAY',
               items: {
-                type: "OBJECT",
+                type: 'OBJECT',
                 properties: {
-                  point: { type: "STRING", maxLength: 200 },
-                  detail: { type: "STRING", maxLength: 500 }
-                }
+                  point: { type: 'STRING' },
+                  detail: { type: 'STRING' }
+                },
+                required: ['point', 'detail']
               }
             },
-            improvements: { 
-              type: "ARRAY",
-              maxItems: 5,
+            improvements: {
+              type: 'ARRAY',
               items: {
-                type: "OBJECT",
+                type: 'OBJECT',
                 properties: {
-                  point: { type: "STRING", maxLength: 200 },
-                  detail: { type: "STRING", maxLength: 500 }
-                }
+                  point: { type: 'STRING' },
+                  detail: { type: 'STRING' }
+                },
+                required: ['point', 'detail']
               }
             },
-            questionAnalysis: { 
-              type: "ARRAY",
-              maxItems: 10,
+            questionAnalysis: {
+              type: 'ARRAY',
               items: {
-                type: "OBJECT",
+                type: 'OBJECT',
                 properties: {
-                  question: { type: "STRING", maxLength: 300 },
-                  answerQuality: { type: "NUMBER" },
-                  feedback: { type: "STRING", maxLength: 600 }
-                }
+                  question: { type: 'STRING' },
+                  answerQuality: { type: 'NUMBER' },
+                  feedback: { type: 'STRING' }
+                },
+                required: ['question', 'answerQuality', 'feedback']
               }
             },
-            communicationScore: { type: "NUMBER" },
-            technicalScore: { type: "NUMBER" },
-            confidenceScore: { type: "NUMBER" },
-            tip: { type: "STRING", maxLength: 400 }
+            communicationScore: { type: 'NUMBER' },
+            technicalScore: { type: 'NUMBER' },
+            confidenceScore: { type: 'NUMBER' },
+            tip: { type: 'STRING' }
           },
-          required: ["overallScore", "summary", "strengths", "improvements", "questionAnalysis", "communicationScore", "technicalScore", "confidenceScore", "tip"]
+          required: ['overallScore', 'summary', 'strengths', 'improvements', 'questionAnalysis', 'communicationScore', 'technicalScore', 'confidenceScore', 'tip']
         }
-      } 
+      }
     })
   })
+
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => ({}))
+    throw new Error(errBody?.error?.message || `HTTP ${res.status}`)
+  }
+
   const data = await res.json()
+
   if (data.error) throw new Error(data.error.message)
-  
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}'
-  try {
-    return JSON.parse(text)
-  } catch (err) {
+
+  // Check for safety blocks or empty candidates
+  const candidate = data.candidates?.[0]
+  if (!candidate) throw new Error('No candidates returned from Gemini')
+  if (candidate.finishReason === 'SAFETY') throw new Error('Response blocked by safety filters')
+
+  const text = candidate.content?.parts?.[0]?.text
+  if (!text || text.trim().length === 0) throw new Error('Empty response text from Gemini')
+
+  return text
+}
+
+/**
+ * Parse the raw text into a JSON object, with repair fallback.
+ */
+function parseAnalysisText(text) {
+  // Attempt 1: Direct parse
+  try { return JSON.parse(text) } catch {}
+
+  // Attempt 2: Extract JSON object from wrapped text
+  const match = text.match(/\{[\s\S]*\}/)
+  if (match) {
+    try { return JSON.parse(match[0]) } catch {}
+  }
+
+  // Attempt 3: Repair truncated JSON
+  const jsonStart = text.indexOf('{')
+  if (jsonStart >= 0) {
+    const repaired = repairTruncatedJson(text.substring(jsonStart))
+    try { return JSON.parse(repaired) } catch {}
+  }
+
+  return null
+}
+
+export async function analyzeInterview(apiKey, transcript, role, cvText) {
+  const trimmedTranscript = transcript.length > 6000
+    ? transcript.substring(0, 6000) + '\n[... transcript trimmed for analysis ...]'
+    : transcript
+
+  const prompt = `You are an expert interview coach. Analyze this interview transcript CONCISELY.
+
+Target Role: ${role || 'General'}
+CV Summary: ${cvText ? cvText.substring(0, 1500) : 'Not provided'}
+
+Transcript:
+${trimmedTranscript}
+
+INSTRUCTIONS — READ CAREFULLY:
+- Return a JSON object matching the schema.
+- Be EXTREMELY CONCISE. Every string value must be SHORT.
+- "summary": 1-3 sentences max (under 200 words).
+- "strengths": EXACTLY 3 items. Each "point" is ONE short sentence (under 15 words). Each "detail" is 1-2 sentences (under 40 words).
+- "improvements": EXACTLY 3 items. Same length rules as strengths.
+- "questionAnalysis": One entry per interview question asked (max 7). "feedback" is 1-2 sentences.
+- "tip": ONE actionable sentence.
+- All scores are numbers from 0 to 10.
+- DO NOT repeat yourself. DO NOT be verbose. DO NOT pad responses.`
+
+  const MODELS = ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash']
+  const MAX_RETRIES = 3
+
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    const model = MODELS[Math.min(attempt, MODELS.length - 1)]
+    console.log(`[Gemini Analysis] Attempt ${attempt + 1}/${MAX_RETRIES} with model ${model}`)
+
     try {
-      // Try to extract JSON if it was accidentally wrapped in text
-      const match = text.match(/\{[\s\S]*\}/)
-      if (match) return JSON.parse(match[0])
-    } catch (innerErr) {
-      // If it still fails, the JSON is irrecoverably corrupted (likely an unescaped quote)
-      throw new Error('Irrecoverable JSON parse error: ' + innerErr.message + '\nRaw Payload: ' + text.substring(0, 100))
+      const rawText = await callGeminiAnalysis(apiKey, prompt, model)
+      console.log(`[Gemini Analysis] Received ${rawText.length} chars`)
+
+      const parsed = parseAnalysisText(rawText)
+      if (!parsed || typeof parsed !== 'object') {
+        console.warn('[Gemini Analysis] Failed to parse response, retrying...')
+        console.warn('[Gemini Analysis] Raw (first 300 chars):', rawText.substring(0, 300))
+        continue
+      }
+
+      const result = sanitizeAnalysis(parsed)
+      console.log('[Gemini Analysis] Success:', { score: result.overallScore, strengths: result.strengths.length, improvements: result.improvements.length })
+      return result
+
+    } catch (err) {
+      console.error(`[Gemini Analysis] Attempt ${attempt + 1} failed:`, err.message)
+      // Brief pause before retry
+      if (attempt < MAX_RETRIES - 1) {
+        await new Promise(r => setTimeout(r, 1000 * (attempt + 1)))
+      }
     }
-    throw new Error('Failed to parse analysis: ' + text)
+  }
+
+  // All retries failed — return a graceful fallback instead of throwing
+  console.error('[Gemini Analysis] All attempts failed, returning fallback analysis')
+  return {
+    overallScore: 6,
+    summary: 'We were unable to generate a detailed AI analysis for this interview session. Please review the transcript for self-assessment.',
+    strengths: [{ point: 'Completed the interview session', detail: 'You participated in the full interview, which demonstrates commitment and effort.' }],
+    improvements: [{ point: 'Try another session for AI feedback', detail: 'The AI analysis encountered an issue. A retry may yield detailed feedback.' }],
+    questionAnalysis: [],
+    communicationScore: 6,
+    technicalScore: 6,
+    confidenceScore: 6,
+    tip: 'Practice answering common interview questions aloud to build confidence and clarity.'
   }
 }
